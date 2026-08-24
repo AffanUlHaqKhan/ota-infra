@@ -1,0 +1,43 @@
+# Whole backend + UI on one machine, for development.
+# Expects the sibling repos checked out next to ota-infra.
+services:
+  api:
+    build: { context: ../../ota-server, dockerfile: deploy/Dockerfile }
+    environment:
+      DATABASE_URL: postgresql://ota:ota@db:5432/ota
+      OSTREE_REPO_PATH: /srv/ostree-repo
+      REPO_PUBLIC_URL: http://localhost:8080/repo
+    volumes: [ostree-repo:/srv/ostree-repo]
+    depends_on: [db]
+
+  repo:
+    image: nginx:alpine
+    volumes:
+      - ../../ota-server/deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ostree-repo:/srv/ostree-repo:ro
+      - ./certs:/etc/nginx/certs:ro
+    ports: ["8080:8080", "8443:8443"]
+
+  web:
+    build: { context: ../../ota-web-ui }
+    environment:
+      VITE_API_URL: http://localhost:8443/api/v1
+    ports: ["5173:80"]
+
+  db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: ota, POSTGRES_PASSWORD: ota, POSTGRES_DB: ota }
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  # One-shot: create the archive repo the first time.
+  repo-init:
+    image: debian:bookworm-slim
+    command: >
+      bash -c "apt-get update && apt-get install -y ostree &&
+               [ -d /srv/ostree-repo/objects ] ||
+               ostree init --repo=/srv/ostree-repo --mode=archive"
+    volumes: [ostree-repo:/srv/ostree-repo]
+
+volumes:
+  ostree-repo:
+  pgdata:

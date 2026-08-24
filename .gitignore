@@ -1,0 +1,9 @@
+# Never commit private keys or state.
+keys/**/*.key
+keys/**/*.pem
+keys/**/*private*
+*.tfstate
+*.tfstate.backup
+.terraform/
+compose/certs/
+.env

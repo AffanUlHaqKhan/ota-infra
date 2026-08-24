@@ -1,0 +1,79 @@
+# GitHub Actions. Needs a self-hosted runner with a warm sstate-cache —
+# a cold Yocto build is hours and will make this pipeline useless.
+name: build-and-publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  MACHINE: raspberrypi4-64
+  BRANCH: raspberrypi4-64-main
+
+jobs:
+  build:
+    runs-on: [self-hosted, yocto]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: meta-ota-platform }
+
+      - name: Sync layers
+        run: |
+          ./scripts/sync-layers.sh   # clones/updates poky, meta-oe, meta-qt6, meta-updater
+
+      - name: Build
+        run: |
+          source poky/oe-init-build-env build
+          cat ../meta-ota-platform/conf/ota.conf >> conf/local.conf
+          echo 'SSTATE_DIR = "/var/cache/yocto/sstate"' >> conf/local.conf
+          echo 'DL_DIR = "/var/cache/yocto/downloads"'  >> conf/local.conf
+          bitbake ota-image
+
+      - name: QEMU smoke test
+        run: ./scripts/qemu-smoke.sh   # boots image, asserts ota-agent + homeautomationgui active
+
+      - name: Sign commit
+        env:
+          OSTREE_GPG_KEY_ID: ${{ secrets.OSTREE_GPG_KEY_ID }}
+        run: |
+          gpg --batch --import <<< "${{ secrets.OSTREE_GPG_PRIVATE_KEY }}"
+          ostree --repo=build/tmp/deploy/images/$MACHINE/ostree_repo \
+                 gpg-sign $(ostree --repo=... rev-parse $BRANCH) "$OSTREE_GPG_KEY_ID"
+
+      - name: Publish
+        env:
+          OTA_PUSH_TOKEN:   ${{ secrets.OTA_PUSH_TOKEN }}
+          OTA_RSYNC_TARGET: ${{ secrets.OTA_RSYNC_TARGET }}
+          BUILD_VERSION:    ${{ github.ref_name }}
+        run: |
+          meta-ota-platform/scripts/push-ostree.sh \
+            build/tmp/deploy/images/$MACHINE/ostree_repo \
+            https://ota.example.com/repo "$BRANCH"
+
+  canary:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start canary rollout
+        run: |
+          curl -fsS -X POST https://ota.example.com/api/v1/rollouts \
+            -H "Authorization: Bearer ${{ secrets.OTA_PUSH_TOKEN }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"branch":"'"$BRANCH"'","version":"${{ github.ref_name }}",
+                 "group":"canary","strategy":"canary","halt_on_failure_pct":5}'
+
+  # Production rollout stays manual on purpose.
+  promote:
+    needs: canary
+    environment: production      # requires human approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Staged rollout
+        run: |
+          curl -fsS -X POST https://ota.example.com/api/v1/rollouts \
+            -H "Authorization: Bearer ${{ secrets.OTA_PUSH_TOKEN }}" \
+            -H 'Content-Type: application/json' \
+            -d '{"branch":"'"$BRANCH"'","version":"${{ github.ref_name }}",
+                 "group":"production","strategy":"staged","waves":[5,25,100],
+                 "soak_minutes":120,"halt_on_failure_pct":2}'
